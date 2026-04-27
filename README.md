@@ -647,4 +647,311 @@ function renderCurrent(current) {
         </div>
         <div class="stat">
           <div class="stat-label">${svg(wxi,12)}<span>Conditions</span></div>
-          <div class="stat-value
+          <div class="stat-value" style="font-size:22px">${wxt}</div>
+          <div class="stat-sub">${current.relative_humidity_2m}% humidity</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderRiverGraph(history) {
+  if (!history || history.length < 3) return '';
+  const points = history.slice(-9);
+  const W = 320, H = 80, P = 14;
+  const vals = points.map(p => p.v);
+  const minV = Math.min(...vals);
+  const maxV = Math.max(...vals);
+  const range = Math.max(0.1, maxV - minV);
+  const padMin = minV - range * 0.15;
+  const padMax = maxV + range * 0.15;
+  const xs = points.map((p, i) => P + (i / (points.length - 1)) * (W - 2 * P));
+  const ys = points.map(p => H - P - ((p.v - padMin) / (padMax - padMin)) * (H - 2 * P));
+
+  const todayMid = new Date();
+  todayMid.setHours(12, 0, 0, 0);
+  const todayMidTs = todayMid.getTime();
+  let todayIdx = 0;
+  for (let i = 0; i < points.length; i++) {
+    if (Math.abs(new Date(points[i].t).getTime() - todayMidTs) 
+        Math.abs(new Date(points[todayIdx].t).getTime() - todayMidTs)) todayIdx = i;
+  }
+
+  let path = `M ${xs[0].toFixed(1)} ${ys[0].toFixed(1)}`;
+  for (let i = 1; i < xs.length; i++) path += ` L ${xs[i].toFixed(1)} ${ys[i].toFixed(1)}`;
+
+  let area = path + ` L ${xs[xs.length-1].toFixed(1)} ${(H - P).toFixed(1)} L ${xs[0].toFixed(1)} ${(H - P).toFixed(1)} Z`;
+
+  const dots = points.map((p, i) => {
+    const isToday = i === todayIdx;
+    const isFuture = new Date(p.t).getTime() > todayMidTs + 12 * 3600 * 1000;
+    const r = isToday ? 4 : 2.5;
+    const fill = isToday ? '#f4ede4' : isFuture ? '#8ba3b8' : '#7bb369';
+    return `<circle cx="${xs[i].toFixed(1)}" cy="${ys[i].toFixed(1)}" r="${r}" fill="${fill}"/>`;
+  }).join('');
+
+  const labels = `
+    <span>${fmtDate(points[0].t)}</span>
+    <span style="color:#d4c7b8">Today</span>
+    <span>${fmtDate(points[points.length - 1].t)}</span>
+  `;
+
+  return `
+    <div style="margin-top:18px">
+      <div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:9px; letter-spacing:0.18em; color:#6b8196; text-transform:uppercase;">Trend · ${points.length} days</span>
+      </div>
+      <svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="none" style="display:block; height:80px;">
+        <defs>
+          <linearGradient id="riverGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#7bb369" stop-opacity="0.35"/>
+            <stop offset="100%" stop-color="#7bb369" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <path d="${area}" fill="url(#riverGrad)" stroke="none"/>
+        <path d="${path}" stroke="#7bb369" stroke-width="2" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+        ${dots}
+        <line x1="${xs[todayIdx].toFixed(1)}" y1="${P}" x2="${xs[todayIdx].toFixed(1)}" y2="${H - P}" stroke="#f4ede4" stroke-width="0.5" stroke-dasharray="2 2" opacity="0.4"/>
+      </svg>
+      <div style="display:flex; justify-content:space-between; font-family:'IBM Plex Mono',monospace; font-size:9px; color:#6b8196; letter-spacing:0.1em; margin-top:4px;">
+        ${labels}
+      </div>
+    </div>
+  `;
+}
+
+function renderRiver(river) {
+  if (!river || river.discharge_kcfs == null) return '';
+  const ratio = river.ratio ?? 1;
+  const dischargeColor = ratio >= RIVER_RATIO_FLOOD ? '#c85a5a'
+                        : ratio >= RIVER_RATIO_ACTION ? '#d4a05c' : '#7bb369';
+
+  const change = river.change24h;
+  const riseIcon = change == null ? 'minus' : change > 0.02 ? 'up' : change < -0.02 ? 'down' : 'minus';
+  const riseDisplay = change == null ? '—' : (change > 0 ? '+' : '') + (change * 100).toFixed(0) + '%';
+
+  const ratioPct = Math.round(ratio * 100);
+  const ratioColor = dischargeColor;
+
+  const maxRef = 250;
+  const pct = Math.min(100, (ratioPct / maxRef) * 100);
+  const normalPct = (100 / maxRef) * 100;
+  const actionPct = (140 / maxRef) * 100;
+  const floodPct = (200 / maxRef) * 100;
+
+  return `
+    <div class="card">
+      <div class="section-head">${svg('waves',14)}<span class="label">River Conditions</span></div>
+      <div class="sub" style="font-size:15px;margin-bottom:14px">Mississippi River · GloFAS modeled discharge</div>
+      <div class="river-grid">
+        <div class="river-stat">
+          <div class="rlabel">DISCHARGE</div>
+          <div class="rval" style="color:${dischargeColor}">${river.discharge_kcfs.toFixed(1)}<span class="runit">kcfs</span></div>
+        </div>
+        <div class="river-stat">
+          <div class="rlabel">VS NORMAL</div>
+          <div class="rval" style="color:${ratioColor}">${ratioPct}<span class="runit">%</span></div>
+        </div>
+        <div class="river-stat">
+          <div class="rlabel">24H CHANGE</div>
+          <div class="rval">${svg(riseIcon,16,'#f4ede4')}<span style="margin-left:4px">${riseDisplay}</span></div>
+        </div>
+      </div>
+      <div class="stage-bar">
+        <div class="stage-fill" style="width:${pct}%;background:linear-gradient(90deg, ${dischargeColor}88 0%, ${dischargeColor} 100%)"></div>
+        <div class="stage-marker" style="left:${normalPct}%;background:#7bb369"></div>
+        <div class="stage-marker" style="left:${actionPct}%;background:#d4a05c"></div>
+        <div class="stage-marker" style="left:${floodPct}%;background:#c85a5a"></div>
+      </div>
+      <div class="stage-legend">
+        <span style="color:#7bb369">NORMAL 100%</span>
+        <span style="color:#d4a05c">ELEVATED</span>
+        <span style="color:#c85a5a">FLOOD</span>
+      </div>
+      ${renderRiverGraph(river.history)}
+      <div class="river-note">Modeled river flow vs the past 14-day average. Rising trends are the strongest signal for incoming debris (logs, brush, washed-out docks).</div>
+    </div>
+  `;
+}
+
+function renderSuggestedWindow(win) {
+  if (!win) return '';
+  if (!win.available) {
+    return `
+      <div class="card" style="border-color:rgba(212,160,92,0.3); background:linear-gradient(180deg,#1f1810 0%,#15100a 100%);">
+        <div class="section-head" style="color:#d4a05c;">${svg('sun',14,'#d4a05c')}<span class="label" style="color:#d4a05c">Today's Window</span></div>
+        <div style="font-family:'Instrument Serif',serif; font-style:italic; font-size:20px; color:#d4c7b8; line-height:1.3; margin-top:4px;">
+          Not recommended today.
+        </div>
+        <div style="font-family:'Manrope',sans-serif; font-size:13px; color:#a89378; margin-top:8px; line-height:1.45;">
+          ${win.reason}
+        </div>
+      </div>
+    `;
+  }
+  const startTime = fmtTime(win.startISO);
+  const endTime = fmtTime(win.endISO);
+  const startsLabel = win.startsNow ? 'Now' : startTime;
+  return `
+    <div class="card" style="border-color:rgba(123,179,105,0.4); background:linear-gradient(180deg,#172418 0%,#0e1810 100%);">
+      <div class="section-head" style="color:#7bb369;">${svg('sun',14,'#7bb369')}<span class="label" style="color:#7bb369">Today's Window</span></div>
+      <div style="font-family:'Instrument Serif',serif; font-size:34px; color:#f4ede4; line-height:1.05; margin-top:4px;">
+        ${startsLabel} <span style="color:#7bb369;">→</span> ${endTime}
+      </div>
+      <div style="font-family:'Manrope',sans-serif; font-size:12px; color:#8ba3b8; margin-top:8px; line-height:1.45;">
+        ${win.durationHours} hour${win.durationHours === 1 ? '' : 's'} of 65°F+ with no rain and light wind
+      </div>
+    </div>
+  `;
+}
+
+function renderHourly(hourly) {
+  if (!hourly) return '';
+  const now = Date.now();
+  const rows = hourly.time
+    .map((t, i) => ({
+      time: t, ts: new Date(t).getTime(),
+      temp: hourly.temperature_2m[i], code: hourly.weather_code[i],
+      wind: hourly.wind_speed_10m[i], pop: hourly.precipitation_probability[i],
+    }))
+    .filter(h => h.ts >= now - 30*60*1000)
+    .slice(0, 16);
+  const hours = rows.map((h, i) => {
+    const windColor = h.wind > 20 ? '#c85a5a' : h.wind > 15 ? '#d4a05c' : '#8ba3b8';
+    const stormy = isStorm(h.code);
+    return `
+      <div class="hour ${stormy?'stormy':''}">
+        <div class="h-time">${i === 0 ? 'Now' : fmtTime(h.time)}</div>
+        <div class="h-icon">${svg(wxIcon(h.code),18)}</div>
+        <div class="h-temp">${Math.round(h.temp)}°</div>
+        <div class="h-wind" style="color:${windColor}">${Math.round(h.wind)}mph</div>
+        ${h.pop >= 30 ? `<div class="h-pop">${Math.round(h.pop)}%</div>` : ''}
+      </div>
+    `;
+  }).join('');
+  return `
+    <div class="card">
+      <div class="section-head">${svg('compass',14)}<span class="label">Next 16 Hours</span></div>
+      <div class="hourly-scroll">${hours}</div>
+    </div>
+  `;
+}
+
+function renderDaily(daily, river) {
+  if (!daily) return '';
+  const days = daily.time.slice(0, 7).map((d, i) => {
+    const windMax = daily.wind_speed_10m_max[i];
+    const gustMax = daily.wind_gusts_10m_max[i];
+    const uvMax = daily.uv_index_max[i];
+    const pop = daily.precipitation_probability_max[i];
+    const windTone = windMax > 20 ? '#c85a5a' : windMax > 15 ? '#d4a05c' : '#d4c7b8';
+    const uvColor = uvBand(uvMax)[1];
+    const score = calcDailyScore(daily, i, river);
+    const scoreColor = score >= 80 ? '#7bb369'
+                     : score >= 60 ? '#d4a05c'
+                     : score >= 40 ? '#e08a3c' : '#c85a5a';
+    return `
+      <div class="day-row">
+        <div>
+          <div class="day-name">${i === 0 ? 'Today' : fmtDay(d)}</div>
+          <div class="day-date">${fmtDate(d)}</div>
+        </div>
+        <div class="day-icon">${svg(wxIcon(daily.weather_code[i]),18)}</div>
+        <div class="day-desc">
+          ${wxText(daily.weather_code[i])}
+          ${pop > 20 ? `<div class="pop">${Math.round(pop)}% precip</div>` : ''}
+        </div>
+        <div class="day-wind" style="color:${windTone}">
+          ${svg('wind',10,windTone)} ${Math.round(windMax)}<span class="gust">/${Math.round(gustMax)}</span>
+          <div class="uv" style="color:${uvColor}">${svg('sun',9,uvColor)} UV ${Math.round(uvMax)}</div>
+        </div>
+        <div class="day-temp">
+          <div class="hi">${Math.round(daily.temperature_2m_max[i])}°</div>
+          <div class="lo">${Math.round(daily.temperature_2m_min[i])}°</div>
+        </div>
+        <div class="day-score">
+          <span class="score-badge" style="color:${scoreColor}" title="Boating score: ${score}/100">${score}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+  return `
+    <div class="card">
+      <div class="section-head">${svg('cloud',14)}<span class="label">7-Day Outlook</span></div>
+      <div style="display:grid; grid-template-columns: 2fr 0.8fr 2.5fr 2fr 1.7fr 1.4fr; gap:6px; padding-bottom:6px; margin-bottom:2px; border-bottom:1px solid rgba(244,237,228,0.06); font-family:'IBM Plex Mono',monospace; font-size:9px; letter-spacing:0.15em; color:#6b8196; text-transform:uppercase;">
+        <div>Day</div><div></div><div>Sky</div><div style="text-align:right">Wind/UV</div><div style="text-align:right">Temp</div><div style="text-align:right">Score</div>
+      </div>
+      ${days}
+    </div>
+  `;
+}
+
+function renderFooter() {
+  return `
+    <footer>
+      <div class="sources">
+        Weather · Open-Meteo<br>
+        Alerts · NWS api.weather.gov<br>
+        River · Open-Meteo Flood (GloFAS)
+      </div>
+      <div class="motto">Always check for hazards. Wear your PFD.</div>
+    </footer>
+  `;
+}
+
+const state = {
+  weather: null, alerts: [], river: null,
+  errors: {}, loading: true, lastUpdated: null,
+};
+
+function render() {
+  const loadingFirst = state.loading && !state.weather;
+  const safety = calcSafety(state);
+  const window_ = state.weather ? computeSuggestedWindow(state.weather) : null;
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    ${renderHeader(state.lastUpdated, state.loading)}
+    ${renderErrors(state.errors)}
+    ${renderAlerts(state.alerts)}
+    ${loadingFirst
+      ? `<div class="card loader">${svg('refresh',20)}<div class="ltext">Reading the river…</div></div>`
+      : renderSafety(safety)
+    }
+    ${renderSuggestedWindow(window_)}
+    ${state.weather ? renderCurrent(state.weather.current) : ''}
+    ${renderRiver(state.river)}
+    ${state.weather ? renderHourly(state.weather.hourly) : ''}
+    ${state.weather ? renderDaily(state.weather.daily, state.river) : ''}
+    ${renderFooter()}
+  `;
+  const btn = document.getElementById('refresh');
+  if (btn) btn.addEventListener('click', () => loadAll());
+}
+
+async function loadAll() {
+  state.loading = true;
+  render();
+  const errors = {};
+  const [w, a, r] = await Promise.allSettled([fetchWeather(), fetchAlerts(), fetchRiver()]);
+  if (w.status === 'fulfilled') state.weather = w.value; else errors.weather = w.reason?.message || 'Failed';
+  if (a.status === 'fulfilled') state.alerts = a.value;  else errors.alerts  = a.reason?.message || 'Failed';
+  if (r.status === 'fulfilled') state.river = r.value;   else errors.river   = r.reason?.message || 'Failed';
+  state.errors = errors;
+  state.lastUpdated = new Date();
+  state.loading = false;
+  render();
+}
+
+render();
+loadAll();
+
+let lastRefresh = Date.now();
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && Date.now() - lastRefresh > 5 * 60 * 1000) {
+    lastRefresh = Date.now();
+    loadAll();
+  }
+});
+</script>
+</body>
+</html>
