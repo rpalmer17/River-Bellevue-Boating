@@ -202,10 +202,42 @@
 // ============================================================================
 const LOCATION = {
   name: 'Bellevue, Iowa',
-  subtitle: 'Mississippi River · Pool 12 → Lock & Dam 11',
+  subtitle: 'Mississippi River · Pool 12',
   lat: 42.2597,
   lon: -90.4246,
 };
+
+// Separate coordinates for the river-discharge query.
+// GloFAS uses a 5 km grid — the LOCATION coordinates above sit on
+// downtown Bellevue and the grid cell can land off-channel, returning
+// 0 or near-zero discharge. These coordinates are nudged east into the
+// Mississippi main channel so the model picks up the actual river.
+const RIVER_QUERY = {
+  lat: 42.2597,
+  lon: -90.395,  // ~0.03° east of Bellevue, mid-channel
+};
+
+// NWS flood-stage thresholds for the Bellevue gauge (BLVI4)
+const STAGE_ACTION   = 16;  // ft — action stage
+const STAGE_MINOR    = 17;  // ft — minor flood (NWS official flood stage)
+const STAGE_MODERATE = 18;  // ft — moderate flood
+const STAGE_MAJOR    = 20;  // ft — major flood
+const STAGE_NORMAL   = 6;   // ft — typical normal pool reference
+
+// Estimate stage (ft) from discharge (kcfs) using the Bellevue rating curve.
+// Anchored on observed BLVI4 readings:
+//   4.83 ft ↔ 33.3 kcfs
+//   5.00 ft ↔ 35.0 kcfs
+//   12.29 ft ↔ 108 kcfs
+// Roughly linear in this normal-flow range. This is an approximation —
+// real gauge data from NWS would be ideal, but USGS API blocks our IP.
+function estimateStageFromKcfs(kcfs) {
+  if (kcfs == null || isNaN(kcfs) || kcfs <= 0) return null;
+  // Linear fit: stage ≈ 0.10 × kcfs + 1.4   (good 30-110 kcfs range)
+  // Below 25 kcfs the relationship gets non-linear; clamp to a minimum.
+  const stage = 0.10 * kcfs + 1.4;
+  return Math.max(2, stage);
+}
 
 // River discharge from Open-Meteo Flood API (GloFAS model).
 // Modeled at ~5 km resolution; ratios vs a 14-day baseline are what we use
@@ -310,32 +342,61 @@ async function fetchAlerts() {
 }
 
 // River discharge from Open-Meteo's Flood API (GloFAS model).
-// Reliable, no API key, browser-friendly, same provider as weather.
+// GloFAS uses a 5km grid — the closest grid cell can land off-channel
+// and return 0. We try several nearby points and keep the highest
+// discharge, which will be the actual main-channel cell.
 async function fetchRiver() {
-  const params = new URLSearchParams({
-    latitude: LOCATION.lat,
-    longitude: LOCATION.lon,
-    daily: 'river_discharge',
-    past_days: 14,
-    forecast_days: 2,
-    timezone: 'America/Chicago',
-  });
-  const r = await fetch(`https://flood-api.open-meteo.com/v1/flood?${params}`);
-  if (!r.ok) throw new Error(`Flood API ${r.status}`);
-  const j = await r.json();
-  const series = (j.daily?.river_discharge || [])
-    .map((v, i) => ({ t: j.daily.time[i], v: v == null ? null : parseFloat(v) }))
-    .filter(p => p.v != null && !isNaN(p.v));
+  const candidates = [
+    { lat: RIVER_QUERY.lat,        lon: RIVER_QUERY.lon },
+    { lat: RIVER_QUERY.lat,        lon: RIVER_QUERY.lon + 0.05 },
+    { lat: RIVER_QUERY.lat,        lon: RIVER_QUERY.lon - 0.05 },
+    { lat: RIVER_QUERY.lat + 0.05, lon: RIVER_QUERY.lon },
+    { lat: RIVER_QUERY.lat - 0.05, lon: RIVER_QUERY.lon },
+    { lat: RIVER_QUERY.lat + 0.05, lon: RIVER_QUERY.lon + 0.05 },
+    { lat: RIVER_QUERY.lat - 0.05, lon: RIVER_QUERY.lon + 0.05 },
+  ];
 
-  if (series.length === 0) throw new Error('No river data returned');
+  let bestSeries = null;
+  let bestLatest = -1;
+  let bestPt = null;
 
-  // Find the most recent past/observed-ish value (today or yesterday).
-  // Forecast days are appended at the end; we use the most recent available.
-  const latest = series[series.length - 1];
-  const yesterday = series.length >= 2 ? series[series.length - 2] : null;
+  for (const pt of candidates) {
+    try {
+      const params = new URLSearchParams({
+        latitude: pt.lat,
+        longitude: pt.lon,
+        daily: 'river_discharge',
+        past_days: 14,
+        forecast_days: 2,
+        timezone: 'America/Chicago',
+      });
+      const r = await fetch(`https://flood-api.open-meteo.com/v1/flood?${params}`);
+      if (!r.ok) continue;
+      const j = await r.json();
+      const series = (j.daily?.river_discharge || [])
+        .map((v, i) => ({ t: j.daily.time[i], v: v == null ? null : parseFloat(v) }))
+        .filter(p => p.v != null && !isNaN(p.v));
+      if (series.length === 0) continue;
+      const latest = series[series.length - 1].v;
+      if (latest > bestLatest) {
+        bestLatest = latest;
+        bestSeries = series;
+        bestPt = pt;
+      }
+    } catch (e) {
+      continue;
+    }
+  }
+
+  if (!bestSeries || bestLatest <= 0) {
+    throw new Error('No river discharge data found in nearby grid cells');
+  }
+
+  const latest = bestSeries[bestSeries.length - 1];
+  const yesterday = bestSeries.length >= 2 ? bestSeries[bestSeries.length - 2] : null;
 
   // 14-day baseline (mean of past days, excluding the latest 2 to avoid bias).
-  const baselineSlice = series.slice(0, Math.max(1, series.length - 2));
+  const baselineSlice = bestSeries.slice(0, Math.max(1, bestSeries.length - 2));
   const baseline = baselineSlice.reduce((a, p) => a + p.v, 0) / baselineSlice.length;
 
   // Convert m³/s → kcfs (×35.3147 / 1000)
@@ -344,97 +405,209 @@ async function fetchRiver() {
   const ratio = baseline > 0 ? latest.v / baseline : null;
   const change24h = (yesterday && yesterday.v > 0) ? (latest.v - yesterday.v) / yesterday.v : null;
 
+  // ---- Seasonal baseline: same ±7 day window, prior 5 years ----
+  // Use the SAME grid cell that gave us valid current data.
+  let seasonalKcfs = null;
+  try {
+    const today = new Date();
+    const samples = [];
+    for (let yr = 1; yr <= 5; yr++) {
+      const start = new Date(today);
+      start.setFullYear(today.getFullYear() - yr);
+      start.setDate(start.getDate() - 7);
+      const end = new Date(today);
+      end.setFullYear(today.getFullYear() - yr);
+      end.setDate(end.getDate() + 7);
+      const fmt = d => d.toISOString().slice(0, 10);
+      const sp = new URLSearchParams({
+        latitude: bestPt.lat,
+        longitude: bestPt.lon,
+        daily: 'river_discharge',
+        start_date: fmt(start),
+        end_date: fmt(end),
+        timezone: 'America/Chicago',
+      });
+      try {
+        const sr = await fetch(`https://flood-api.open-meteo.com/v1/flood?${sp}`);
+        if (!sr.ok) continue;
+        const sj = await sr.json();
+        for (const v of (sj.daily?.river_discharge || [])) {
+          const num = v == null ? NaN : parseFloat(v);
+          if (!isNaN(num) && num > 0) samples.push(num);
+        }
+      } catch (_) { /* skip year */ }
+    }
+    if (samples.length > 0) {
+      const meanM3s = samples.reduce((a, b) => a + b, 0) / samples.length;
+      seasonalKcfs = toKcfs(meanM3s);
+    }
+  } catch (_) { /* leave seasonalKcfs null */ }
+
   return {
     discharge_kcfs: toKcfs(latest.v),
     baseline_kcfs: toKcfs(baseline),
-    ratio,                  // current / 14-day baseline
-    change24h,              // fractional change vs yesterday
-    history: series.map(p => ({ t: p.t, v: toKcfs(p.v) })),
+    seasonal_kcfs: seasonalKcfs,
+    stage_ft: estimateStageFromKcfs(toKcfs(latest.v)),
+    ratio,
+    change24h,
+    history: bestSeries.map(p => ({ t: p.t, v: toKcfs(p.v) })),
   };
 }
 
 // ============================================================================
 // BOATING SAFETY SCORE
 // ============================================================================
+// ============================================================================
+// DAY-LEVEL BOATING SCORE
+// Looks at TODAY's whole day (sunrise → sunset) instead of just current
+// conditions. Counts how many "good" daylight hours exist; a day needs at
+// least 4 good hours for a strong overall score. Current conditions still
+// influence the score but no longer dominate it.
+// ============================================================================
 function calcSafety({ weather, alerts, river }) {
   if (!weather) return null;
   const c = weather.current;
+  const daily = weather.daily;
+  const hourly = weather.hourly;
   let score = 100;
   const factors = [];
 
-  const w = c.wind_speed_10m;
-  const g = c.wind_gusts_10m;
-  const dir = windDir(c.wind_direction_10m);
+  // ---- Pull today's daylight hours ----
+  const sunrise = daily.sunrise?.[0] ? new Date(daily.sunrise[0]).getTime() : null;
+  const sunset  = daily.sunset?.[0]  ? new Date(daily.sunset[0]).getTime()  : null;
+  const todayEnd = new Date(); todayEnd.setHours(23, 59, 0, 0);
 
-  if (w > 25)      { score -= 55; factors.push(['red','wind',`Sustained ${Math.round(w)} mph ${dir} — unsafe for pontoon`]); }
-  else if (w > 20) { score -= 35; factors.push(['red','wind',`Heavy wind ${Math.round(w)} mph ${dir} — rough chop`]); }
-  else if (w > 15) { score -= 18; factors.push(['amber','wind',`Brisk ${Math.round(w)} mph ${dir} — expect chop on open pools`]); }
-  else if (w > 10) { factors.push(['good','wind',`Light breeze ${Math.round(w)} mph ${dir}`]); }
-  else             { factors.push(['good','wind',`Calm — ${Math.round(w)} mph`]); }
+  const dayHours = hourly.time
+    .map((t, i) => ({
+      t: new Date(t).getTime(),
+      iso: t,
+      temp: hourly.temperature_2m[i],
+      code: hourly.weather_code[i],
+      wind: hourly.wind_speed_10m[i],
+      gust: hourly.wind_gusts_10m[i],
+      pop:  hourly.precipitation_probability[i] ?? 0,
+    }))
+    .filter(x => x.t <= todayEnd.getTime())
+    .filter(x => sunrise == null || sunset == null || (x.t >= sunrise && x.t <= sunset));
 
-  if (g > 30)      { score -= 15; factors.push(['red','zap',`Gusts to ${Math.round(g)} mph`]); }
-  else if (g > 25) { score -= 8;  factors.push(['amber','zap',`Gusts to ${Math.round(g)} mph`]); }
+  // ---- Score each daylight hour as good/marginal/bad ----
+  const hourQuality = dayHours.map(h => {
+    if (isStorm(h.code)) return 'bad';
+    if (isHeavyRain(h.code)) return 'bad';
+    if (h.temp < 65) return 'bad';
+    if (h.wind > 25) return 'bad';
+    if (isRain(h.code)) return 'marginal';
+    if (h.pop >= 50) return 'marginal';
+    if (h.wind > 20) return 'marginal';
+    if (h.gust > 30) return 'marginal';
+    return 'good';
+  });
+  const goodCount = hourQuality.filter(q => q === 'good').length;
+  const badCount = hourQuality.filter(q => q === 'bad').length;
 
-  // --- TEMPERATURE: heavy weight per user preference (won't boat below 65°F) ---
-  const todayMaxTemp = weather.daily?.temperature_2m_max?.[0] ?? c.temperature_2m;
+  // ---- Find longest contiguous good block ----
+  let longestGoodBlock = 0, cur = 0;
+  for (const q of hourQuality) {
+    if (q === 'good') { cur++; if (cur > longestGoodBlock) longestGoodBlock = cur; }
+    else cur = 0;
+  }
+
+  // ---- DAY-LEVEL FACTORS ----
+  const todayMaxTemp = daily.temperature_2m_max?.[0] ?? c.temperature_2m;
+  const todayMinTemp = daily.temperature_2m_min?.[0];
+  const todayMaxWind = daily.wind_speed_10m_max?.[0] ?? 0;
+  const todayMaxGust = daily.wind_gusts_10m_max?.[0] ?? 0;
+  const todayMaxPop  = daily.precipitation_probability_max?.[0] ?? 0;
+  const todayCode    = daily.weather_code?.[0];
+  const todayUVMax   = daily.uv_index_max?.[0] ?? 0;
+
+  // Temperature — heavy weight per user preference (≥65°F minimum)
   if (todayMaxTemp < 65) {
-    score -= 50;
+    score -= 55;
     factors.push(['red','thermo',`Today's high only ${Math.round(todayMaxTemp)}°F — below your 65°F minimum`]);
-  } else if (c.temperature_2m < 65) {
+  } else if (todayMaxTemp < 68) {
     score -= 8;
-    factors.push(['info','thermo',`Currently ${Math.round(c.temperature_2m)}°F — will warm up today (high ${Math.round(todayMaxTemp)}°F)`]);
+    factors.push(['amber','thermo',`Marginal warmth — high ${Math.round(todayMaxTemp)}°F`]);
+  } else {
+    factors.push(['good','thermo',`Today's high ${Math.round(todayMaxTemp)}°F` + (todayMinTemp != null ? ` (low ${Math.round(todayMinTemp)}°F)` : '')]);
   }
 
-  // --- CURRENT PRECIPITATION: heavy weight per user preference (no rain boating) ---
-  if (isStorm(c.weather_code)) {
-    score -= 60;
-    factors.push(['red','storm','Thunderstorm now — do not launch']);
-  } else if (isHeavyRain(c.weather_code)) {
-    score -= 45;
-    factors.push(['red','rain','Heavy rain falling now']);
-  } else if (isRain(c.weather_code)) {
-    score -= 25;
-    factors.push(['amber','rain','Rain falling now']);
+  // Good-hours requirement: need at least 4 good daylight hours
+  if (longestGoodBlock >= 4) {
+    factors.push(['good','sun',`${longestGoodBlock} contiguous hours of good conditions today`]);
+  } else if (goodCount >= 4) {
+    score -= 10;
+    factors.push(['amber','sun',`${goodCount} good hours today, but split across the day (longest ${longestGoodBlock}h block)`]);
+  } else if (goodCount >= 2) {
+    score -= 30;
+    factors.push(['amber','sun',`Only ${goodCount} good hours today (need 4+ for a solid window)`]);
+  } else {
+    score -= 50;
+    factors.push(['red','sun',`Only ${goodCount} good hour${goodCount === 1 ? '' : 's'} today — not a boating day`]);
   }
 
+  // Rain throughout the day — heavy weight per user preference
+  if (isStorm(todayCode)) {
+    score -= 35;
+    factors.push(['red','storm','Thunderstorms forecast today']);
+  } else if (isHeavyRain(todayCode)) {
+    score -= 30;
+    factors.push(['red','rain','Heavy rain forecast today']);
+  } else if (isRain(todayCode)) {
+    score -= 20;
+    factors.push(['amber','rain',`Rain in today's forecast (${Math.round(todayMaxPop)}% chance)`]);
+  } else if (todayMaxPop >= 70) {
+    score -= 15;
+    factors.push(['amber','rain',`High precipitation chance today (${Math.round(todayMaxPop)}%)`]);
+  } else if (todayMaxPop >= 50) {
+    score -= 8;
+    factors.push(['amber','rain',`Moderate precipitation chance (${Math.round(todayMaxPop)}%)`]);
+  }
+
+  // Wind — daily max
+  if (todayMaxWind > 25) {
+    score -= 30;
+    factors.push(['red','wind',`Peak winds ${Math.round(todayMaxWind)} mph — unsafe for pontoon`]);
+  } else if (todayMaxWind > 20) {
+    score -= 18;
+    factors.push(['amber','wind',`Peak winds ${Math.round(todayMaxWind)} mph — rough chop expected`]);
+  } else if (todayMaxWind > 15) {
+    score -= 8;
+    factors.push(['amber','wind',`Brisk winds up to ${Math.round(todayMaxWind)} mph`]);
+  } else {
+    factors.push(['good','wind',`Light winds today (peak ${Math.round(todayMaxWind)} mph)`]);
+  }
+  if (todayMaxGust > 35) {
+    score -= 10;
+    factors.push(['red','zap',`Gusts to ${Math.round(todayMaxGust)} mph`]);
+  } else if (todayMaxGust > 30) {
+    score -= 5;
+    factors.push(['amber','zap',`Gusts to ${Math.round(todayMaxGust)} mph`]);
+  }
+
+  // ---- NWS ALERTS ----
   const flood = alerts.find(a => /flood/i.test(a.event));
   const severe = alerts.find(a => /tornado|severe thunderstorm|special marine|hurricane/i.test(a.event));
   if (severe) { score -= 55; factors.push(['red','alert',`NWS: ${severe.event}`]); }
   if (flood)  { score -= 35; factors.push(['red','waves',`NWS: ${flood.event} — debris & current risk`]); }
 
-  const hourly = weather.hourly;
-  const now = Date.now();
-  const upcoming = hourly.time
-    .map((t,i) => ({
-      t: new Date(t).getTime(),
-      code: hourly.weather_code[i],
-      pop: hourly.precipitation_probability[i] || 0,
-    }))
-    .filter(h => h.t >= now - 30*60*1000 && h.t <= now + 6*3600*1000);
-  const stormSoon = upcoming.find(h => isStorm(h.code));
-  if (stormSoon) {
-    score -= 40;
-    const hrs = Math.max(0, Math.round((stormSoon.t - now) / 3600000));
-    factors.push(['red','storm',`Thunderstorm forecast in ~${hrs}h`]);
-  } else {
-    // Heavier weight on incoming rain since user dislikes rain
-    const rainSoon = upcoming.find(h => isRain(h.code) || h.pop >= 60);
-    if (rainSoon) {
-      score -= 18;
-      const hrs = Math.max(0, Math.round((rainSoon.t - now) / 3600000));
-      factors.push(['amber','rain',`Rain forecast in ~${hrs}h (${Math.round(rainSoon.pop)}% chance)`]);
-    }
-  }
-
-  if (river && river.ratio != null) {
-    if (river.ratio >= RIVER_RATIO_FLOOD) {
-      score -= 30;
-      factors.push(['red','waves',`Discharge ${(river.ratio*100).toFixed(0)}% of normal — flood-stage water, debris risk high`]);
-    } else if (river.ratio >= RIVER_RATIO_ACTION) {
+  // ---- RIVER ----
+  if (river && river.stage_ft != null) {
+    const stage = river.stage_ft;
+    if (stage >= STAGE_MAJOR) {
+      score -= 50;
+      factors.push(['red','waves',`Major flood stage (${stage.toFixed(1)} ft) — do not boat`]);
+    } else if (stage >= STAGE_MODERATE) {
+      score -= 35;
+      factors.push(['red','waves',`Moderate flood stage (${stage.toFixed(1)} ft) — heavy debris, strong current`]);
+    } else if (stage >= STAGE_MINOR) {
+      score -= 25;
+      factors.push(['red','waves',`Minor flood stage (${stage.toFixed(1)} ft) — debris and current risk`]);
+    } else if (stage >= STAGE_ACTION) {
       score -= 12;
-      factors.push(['amber','waves',`Discharge ${(river.ratio*100).toFixed(0)}% of normal — elevated, debris likely`]);
+      factors.push(['amber','waves',`Action stage (${stage.toFixed(1)} ft) — elevated water, debris likely`]);
     } else {
-      factors.push(['good','waves',`River discharge near normal (${river.discharge_kcfs.toFixed(1)} kcfs)`]);
+      factors.push(['good','waves',`River stage normal (${stage.toFixed(1)} ft)`]);
     }
     if (river.change24h != null) {
       if (river.change24h >= RIVER_RISE_24H_HIGH) {
@@ -449,30 +622,38 @@ function calcSafety({ weather, alerts, river }) {
     }
   }
 
-  const uv = c.uv_index;
-  if (uv >= 8) factors.push(['amber','sun',`UV ${Math.round(uv)} — very high, sunscreen + shade essential`]);
-  else if (uv >= 6) factors.push(['info','sun',`UV ${Math.round(uv)} — high, sunscreen advised`]);
+  // ---- INFORMATIONAL: UV ----
+  if (todayUVMax >= 8) factors.push(['amber','sun',`UV peak ${Math.round(todayUVMax)} — very high, sunscreen + shade essential`]);
+  else if (todayUVMax >= 6) factors.push(['info','sun',`UV peak ${Math.round(todayUVMax)} — high, sunscreen advised`]);
 
+  // ---- FOG (current) ----
   if (c.weather_code === 45 || c.weather_code === 48) {
-    score -= 20; factors.push(['amber','eye','Fog — poor visibility for navigation']);
+    score -= 15;
+    factors.push(['amber','eye','Fog now — poor visibility for navigation']);
   }
 
   score = Math.max(0, Math.min(100, score));
 
+  // ---- VERDICT — 4+ good hours required for GOOD TO GO ----
   let verdict;
-  if (score >= 80)      verdict = { label: 'GOOD TO GO',      tone: 'green',  note: 'Conditions favor a safe day on the water.' };
-  else if (score >= 60) verdict = { label: 'USE CAUTION',     tone: 'amber',  note: 'Boating is acceptable — stay alert and monitor changes.' };
-  else if (score >= 40) verdict = { label: 'POOR CONDITIONS', tone: 'orange', note: 'Not recommended unless experienced and prepared.' };
-  else                  verdict = { label: 'UNSAFE',          tone: 'red',    note: 'Stay ashore — conditions are hazardous.' };
+  if (score >= 80 && longestGoodBlock >= 4) {
+    verdict = { label: 'GOOD TO GO', tone: 'green', note: 'Today has a solid window for boating.' };
+  } else if (score >= 65 && goodCount >= 4) {
+    verdict = { label: 'WORKABLE DAY', tone: 'amber', note: 'Today is decent — pick the right hours and stay alert.' };
+  } else if (score >= 45) {
+    verdict = { label: 'POOR CONDITIONS', tone: 'orange', note: 'Not recommended unless experienced and prepared.' };
+  } else {
+    verdict = { label: 'NOT TODAY', tone: 'red', note: 'Conditions don\'t support a safe boating day.' };
+  }
 
-  return { score, verdict, factors };
+  return { score, verdict, factors, longestGoodBlock, goodCount };
 }
 
 // Per-day forecast score for the 7-day outlook. Uses daily aggregates
 // (max temp, max wind/gust, weather code, precip probability) and the
 // current river state. Same weighting philosophy as calcSafety: heavy
 // penalties for sub-65°F, rain, and storms.
-function calcDailyScore(daily, i, river) {
+function calcDailyScore(daily, i, river, hourly) {
   if (!daily) return null;
   let score = 100;
   const code = daily.weather_code[i];
@@ -482,32 +663,54 @@ function calcDailyScore(daily, i, river) {
   const popMax = daily.precipitation_probability_max[i] ?? 0;
 
   // Temperature — biggest single factor per user preference
-  if (tempMax < 65) score -= 50;
+  if (tempMax < 65) score -= 55;
   else if (tempMax < 70) score -= 5;
 
   // Weather code: storms / rain
-  if (isStorm(code)) score -= 50;
-  else if (isHeavyRain(code)) score -= 35;
-  else if (isRain(code)) score -= 22;
+  if (isStorm(code)) score -= 35;
+  else if (isHeavyRain(code)) score -= 28;
+  else if (isRain(code)) score -= 20;
   else {
-    // No rain in the code, but high probability = uncertain
-    if (popMax >= 70) score -= 18;
+    if (popMax >= 70) score -= 15;
     else if (popMax >= 50) score -= 8;
   }
 
   // Wind
-  if (windMax > 25) score -= 35;
-  else if (windMax > 20) score -= 22;
-  else if (windMax > 15) score -= 10;
+  if (windMax > 25) score -= 30;
+  else if (windMax > 20) score -= 18;
+  else if (windMax > 15) score -= 8;
 
   // Gusts
-  if (gustMax > 35) score -= 12;
-  else if (gustMax > 30) score -= 6;
+  if (gustMax > 35) score -= 10;
+  else if (gustMax > 30) score -= 5;
 
-  // River state — penalize all forecast days if currently elevated/flooding
-  if (river && river.ratio != null) {
-    if (river.ratio >= RIVER_RATIO_FLOOD) score -= 22;
-    else if (river.ratio >= RIVER_RATIO_ACTION) score -= 8;
+  // Good-hours requirement — count hourly data for this calendar day
+  if (hourly && daily.time?.[i] && daily.sunrise?.[i] && daily.sunset?.[i]) {
+    const sunrise = new Date(daily.sunrise[i]).getTime();
+    const sunset = new Date(daily.sunset[i]).getTime();
+    const dayHours = hourly.time
+      .map((t, j) => ({
+        t: new Date(t).getTime(),
+        temp: hourly.temperature_2m[j],
+        code: hourly.weather_code[j],
+        wind: hourly.wind_speed_10m[j],
+        pop: hourly.precipitation_probability[j] ?? 0,
+      }))
+      .filter(h => h.t >= sunrise && h.t <= sunset);
+    let longestGood = 0, cur = 0;
+    for (const h of dayHours) {
+      const good = h.temp >= 65 && !isRain(h.code) && !isStorm(h.code) && h.wind <= 20 && h.pop < 50;
+      if (good) { cur++; if (cur > longestGood) longestGood = cur; }
+      else cur = 0;
+    }
+    if (longestGood < 2) score -= 25;
+    else if (longestGood < 4) score -= 12;
+  }
+
+  // River state
+  if (river && river.stage_ft != null) {
+    if (river.stage_ft >= STAGE_MINOR) score -= 25;
+    else if (river.stage_ft >= STAGE_ACTION) score -= 8;
   }
 
   return Math.max(0, Math.min(100, score));
@@ -688,35 +891,79 @@ function renderSafety(safety) {
   `;
 }
 
-function renderCurrent(current) {
+function renderCurrent(current, daily) {
   if (!current) return '';
   const [uvLabel, uvColor] = uvBand(current.uv_index);
-  const windAccent = current.wind_speed_10m > 20 ? '#c85a5a' : current.wind_speed_10m > 15 ? '#d4a05c' : '#f4ede4';
+  const ws = current.wind_speed_10m;
+  const windAccent = ws > 20 ? '#c85a5a'
+                   : ws > 15 ? '#e08a3c'
+                   : ws > 10 ? '#d4c05c'
+                   :          '#7bb369';
+  const windDeg = current.wind_direction_10m;
   const wxt = wxText(current.weather_code);
   const wxi = wxIcon(current.weather_code);
+  const todayHi = daily?.temperature_2m_max?.[0] ?? current.temperature_2m;
+  const todayLo = daily?.temperature_2m_min?.[0] ?? current.temperature_2m;
+  const uvMaxToday = daily?.uv_index_max?.[0];
+  const [uvMaxLabel, uvMaxColor] = uvMaxToday != null ? uvBand(uvMaxToday) : ['', uvColor];
+  // Compass: 60px diameter, arrow tip at radius 28 (outside the circle ring at 24)
+  const cx = 30, cy = 30, r = 24, arrowR = 28;
+  // Wind direction is "from" — convert to angle in SVG (0deg=N at top, clockwise)
+  const rad = (windDeg - 90) * Math.PI / 180;
+  const ax = cx + arrowR * Math.cos(rad);
+  const ay = cy + arrowR * Math.sin(rad);
   return `
     <div>
       <div class="section-head">${svg('thermo',14)}<span class="label">Current</span></div>
       <div class="stat-grid">
-        <div class="stat">
-          <div class="stat-label">${svg('thermo',12)}<span>Temp</span></div>
-          <div class="stat-value">${Math.round(current.temperature_2m)}<span class="stat-unit">°F</span></div>
-          <div class="stat-sub">Feels ${Math.round(current.apparent_temperature)}°</div>
+        <!-- TEMP -->
+        <div class="stat" style="display:flex; flex-direction:column; align-items:center; text-align:center; min-height:200px; justify-content:space-between;">
+          <div class="stat-label" style="justify-content:center;">${svg('thermo',12)}<span>Temp</span></div>
+          <div style="display:flex; align-items:baseline; gap:4px; justify-content:center;">
+            <span style="font-family:'Instrument Serif',serif; font-size:64px; line-height:1; color:#f4ede4;">${Math.round(current.temperature_2m)}</span>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:14px; color:#8ba3b8;">°F</span>
+          </div>
+          <div style="display:flex; gap:10px; align-items:baseline; font-family:'IBM Plex Mono',monospace; font-size:11px; justify-content:center;">
+            <span style="color:#e08a3c;">↑${Math.round(todayHi)}°</span>
+            <span style="color:#6da3c8;">↓${Math.round(todayLo)}°</span>
+            <span style="color:#8ba3b8;">Feels ${Math.round(current.apparent_temperature)}°</span>
+          </div>
         </div>
-        <div class="stat">
-          <div class="stat-label">${svg('wind',12)}<span>Wind</span></div>
-          <div class="stat-value" style="color:${windAccent}">${Math.round(current.wind_speed_10m)}<span class="stat-unit">mph ${windDir(current.wind_direction_10m)}</span></div>
-          <div class="stat-sub">Gusts ${Math.round(current.wind_gusts_10m)} mph</div>
+
+        <!-- WIND -->
+        <div class="stat" style="display:flex; flex-direction:column; align-items:center; text-align:center; min-height:200px; justify-content:space-between;">
+          <div class="stat-label" style="justify-content:center;">${svg('wind',12)}<span>Wind</span></div>
+          <svg width="110" height="110" viewBox="0 0 100 100" style="flex-shrink:0;">
+            <circle cx="50" cy="50" r="40" fill="none" stroke="rgba(244,237,228,0.15)" stroke-width="1"/>
+            <text x="50" y="13" text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="12" fill="#d4c7b8" font-weight="700">N</text>
+            <text x="93" y="54" text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="12" fill="#d4c7b8" font-weight="700">E</text>
+            <text x="50" y="97" text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="12" fill="#d4c7b8" font-weight="700">S</text>
+            <text x="7" y="54" text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="12" fill="#d4c7b8" font-weight="700">W</text>
+            <polygon points="${50 + 47*Math.cos((windDeg - 90) * Math.PI / 180)},${50 + 47*Math.sin((windDeg - 90) * Math.PI / 180)} ${50 + 39*Math.cos((windDeg - 90) * Math.PI / 180 - 0.32)},${50 + 39*Math.sin((windDeg - 90) * Math.PI / 180 - 0.32)} ${50 + 39*Math.cos((windDeg - 90) * Math.PI / 180 + 0.32)},${50 + 39*Math.sin((windDeg - 90) * Math.PI / 180 + 0.32)}" fill="${windAccent}" stroke="${windAccent}" stroke-width="0.5" stroke-linejoin="round"/>
+            <text x="50" y="52" text-anchor="middle" font-family="Instrument Serif,serif" font-size="28" fill="${windAccent}">${Math.round(ws)}</text>
+            <text x="50" y="64" text-anchor="middle" font-family="IBM Plex Mono,monospace" font-size="7" fill="#8ba3b8">mph ${windDir(windDeg)}</text>
+          </svg>
+          <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8ba3b8;">Gusts ${Math.round(current.wind_gusts_10m)} mph</div>
         </div>
-        <div class="stat">
-          <div class="stat-label">${svg('sun',12)}<span>UV Index</span></div>
-          <div class="stat-value" style="color:${uvColor}">${Math.round(current.uv_index)}</div>
-          <div class="stat-sub">${uvLabel}</div>
+
+        <!-- UV INDEX -->
+        <div class="stat" style="display:flex; flex-direction:column; align-items:center; text-align:center; min-height:200px; justify-content:space-between;">
+          <div class="stat-label" style="justify-content:center;">${svg('sun',12)}<span>UV Index</span></div>
+          <span style="font-family:'Instrument Serif',serif; font-size:64px; line-height:1; color:${uvColor};">${Math.round(current.uv_index)}</span>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:2px;">
+            <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:${uvColor};">${uvLabel.toUpperCase()}</div>
+            ${uvMaxToday != null ? `<div style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#8ba3b8;">PEAK <span style="color:${uvMaxColor};">${Math.round(uvMaxToday)}</span> TODAY</div>` : ''}
+          </div>
         </div>
-        <div class="stat">
-          <div class="stat-label">${svg(wxi,12)}<span>Conditions</span></div>
-          <div class="stat-value" style="font-size:22px">${wxt}</div>
-          <div class="stat-sub">${current.relative_humidity_2m}% humidity</div>
+
+        <!-- CONDITIONS -->
+        <div class="stat" style="display:flex; flex-direction:column; align-items:center; text-align:center; min-height:200px; justify-content:space-between;">
+          <div class="stat-label" style="justify-content:center;">${svg(wxi,12)}<span>Conditions</span></div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            ${svg(wxi, 44, '#d4c7b8')}
+            <div style="font-family:'Instrument Serif',serif; font-size:20px; color:#f4ede4; line-height:1.1;">${wxt}</div>
+          </div>
+          <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8ba3b8;">${current.relative_humidity_2m}% humidity</div>
         </div>
       </div>
     </div>
@@ -770,22 +1017,30 @@ function renderRiverGraph(history) {
 
   return `
     <div style="margin-top:18px">
-      <div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
-        <span style="font-family:'IBM Plex Mono',monospace; font-size:9px; letter-spacing:0.18em; color:#6b8196; text-transform:uppercase;">Trend · ${points.length} days</span>
+      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:9px; letter-spacing:0.18em; color:#6b8196; text-transform:uppercase;">Discharge Trend · ${points.length} days</span>
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:9px; color:#6b8196;">kcfs</span>
       </div>
-      <svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="none" style="display:block; height:80px;">
-        <defs>
-          <linearGradient id="riverGrad" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#7bb369" stop-opacity="0.35"/>
-            <stop offset="100%" stop-color="#7bb369" stop-opacity="0"/>
-          </linearGradient>
-        </defs>
-        <path d="${area}" fill="url(#riverGrad)" stroke="none"/>
-        <path d="${path}" stroke="#7bb369" stroke-width="2" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
-        ${dots}
-        <line x1="${xs[todayIdx].toFixed(1)}" y1="${P}" x2="${xs[todayIdx].toFixed(1)}" y2="${H - P}" stroke="#f4ede4" stroke-width="0.5" stroke-dasharray="2 2" opacity="0.4"/>
-      </svg>
-      <div style="display:flex; justify-content:space-between; font-family:'IBM Plex Mono',monospace; font-size:9px; color:#6b8196; letter-spacing:0.1em; margin-top:4px;">
+      <div style="display:flex; gap:6px;">
+        <div style="display:flex; flex-direction:column; justify-content:space-between; font-family:'IBM Plex Mono',monospace; font-size:8.5px; color:#6b8196; padding:${P}px 0;">
+          <span>${maxV.toFixed(0)}</span>
+          <span>${((maxV+minV)/2).toFixed(0)}</span>
+          <span>${minV.toFixed(0)}</span>
+        </div>
+        <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block; height:80px; flex:1;">
+          <defs>
+            <linearGradient id="riverGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#7bb369" stop-opacity="0.35"/>
+              <stop offset="100%" stop-color="#7bb369" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          <path d="${area}" fill="url(#riverGrad)" stroke="none"/>
+          <path d="${path}" stroke="#7bb369" stroke-width="2" fill="none" stroke-linejoin="round" stroke-linecap="round"/>
+          ${dots}
+          <line x1="${xs[todayIdx].toFixed(1)}" y1="${P}" x2="${xs[todayIdx].toFixed(1)}" y2="${H - P}" stroke="#f4ede4" stroke-width="0.5" stroke-dasharray="2 2" opacity="0.4"/>
+        </svg>
+      </div>
+      <div style="display:flex; justify-content:space-between; font-family:'IBM Plex Mono',monospace; font-size:9px; color:#6b8196; letter-spacing:0.1em; margin-top:4px; padding-left:24px;">
         ${labels}
       </div>
     </div>
@@ -794,55 +1049,91 @@ function renderRiverGraph(history) {
 
 function renderRiver(river) {
   if (!river || river.discharge_kcfs == null) return '';
-  const ratio = river.ratio ?? 1;
-  const dischargeColor = ratio >= RIVER_RATIO_FLOOD ? '#c85a5a'
-                        : ratio >= RIVER_RATIO_ACTION ? '#d4a05c' : '#7bb369';
+  const stage = river.stage_ft;
+
+  // Stage-based color (more meaningful than discharge ratio for boaters)
+  const stageColor = stage == null ? '#7bb369'
+    : stage >= STAGE_MAJOR    ? '#a04080'
+    : stage >= STAGE_MODERATE ? '#c85a5a'
+    : stage >= STAGE_MINOR    ? '#e08a3c'
+    : stage >= STAGE_ACTION   ? '#d4a05c'
+    : '#7bb369';
+
+  const stageLabel = stage == null ? 'Unknown'
+    : stage >= STAGE_MAJOR    ? 'MAJOR FLOOD'
+    : stage >= STAGE_MODERATE ? 'MODERATE FLOOD'
+    : stage >= STAGE_MINOR    ? 'MINOR FLOOD'
+    : stage >= STAGE_ACTION   ? 'ACTION STAGE'
+    : 'NORMAL';
 
   const change = river.change24h;
   const riseIcon = change == null ? 'minus' : change > 0.02 ? 'up' : change < -0.02 ? 'down' : 'minus';
   const riseDisplay = change == null ? '—' : (change > 0 ? '+' : '') + (change * 100).toFixed(0) + '%';
 
-  const ratioPct = Math.round(ratio * 100);
-  const ratioColor = dischargeColor;
-
-  // Bar: scale 0 → 250% with markers at 100 (normal), 140 (action), 200 (flood)
-  const maxRef = 250;
-  const pct = Math.min(100, (ratioPct / maxRef) * 100);
-  const normalPct = (100 / maxRef) * 100;
-  const actionPct = (140 / maxRef) * 100;
-  const floodPct = (200 / maxRef) * 100;
+  // Stage scale 0 → 22 ft (covers Major flood + headroom)
+  const maxStage = 22;
+  const stagePct = stage == null ? 0 : Math.min(100, (stage / maxStage) * 100);
+  const normalPct = (STAGE_NORMAL / maxStage) * 100;
+  const actionPct = (STAGE_ACTION / maxStage) * 100;
+  const minorPct  = (STAGE_MINOR  / maxStage) * 100;
+  const modPct    = (STAGE_MODERATE / maxStage) * 100;
+  const majorPct  = (STAGE_MAJOR  / maxStage) * 100;
 
   return `
     <div class="card">
       <div class="section-head">${svg('waves',14)}<span class="label">River Conditions</span></div>
-      <div class="sub" style="font-size:15px;margin-bottom:14px">Mississippi River · GloFAS modeled discharge</div>
-      <div class="river-grid">
-        <div class="river-stat">
-          <div class="rlabel">DISCHARGE</div>
-          <div class="rval" style="color:${dischargeColor}">${river.discharge_kcfs.toFixed(1)}<span class="runit">kcfs</span></div>
-        </div>
-        <div class="river-stat">
-          <div class="rlabel">VS NORMAL</div>
-          <div class="rval" style="color:${ratioColor}">${ratioPct}<span class="runit">%</span></div>
-        </div>
-        <div class="river-stat">
-          <div class="rlabel">24H CHANGE</div>
-          <div class="rval">${svg(riseIcon,16,'#f4ede4')}<span style="margin-left:4px">${riseDisplay}</span></div>
-        </div>
+      <div class="sub" style="font-size:15px;margin-bottom:14px">Mississippi at Bellevue · Pool 12</div>
+
+      <!-- STAGE GROUP -->
+      <div style="font-family:'IBM Plex Mono',monospace; font-size:9px; letter-spacing:0.18em; color:#6b8196; text-transform:uppercase; margin-bottom:8px;">Water Level</div>
+      <div style="display:flex; align-items:baseline; gap:12px; margin-bottom:6px;">
+        <div class="rval" style="color:${stageColor}; font-size:36px;">${stage == null ? '—' : stage.toFixed(1)}<span class="runit">ft</span></div>
+        <div style="font-family:'Manrope',sans-serif; font-size:11px; font-weight:700; letter-spacing:0.15em; color:${stageColor};">${stageLabel}</div>
       </div>
-      <div class="stage-bar">
-        <div class="stage-fill" style="width:${pct}%;background:linear-gradient(90deg, ${dischargeColor}88 0%, ${dischargeColor} 100%)"></div>
-        <div class="stage-marker" style="left:${normalPct}%;background:#7bb369"></div>
-        <div class="stage-marker" style="left:${actionPct}%;background:#d4a05c"></div>
-        <div class="stage-marker" style="left:${floodPct}%;background:#c85a5a"></div>
+
+      <div class="stage-bar" style="height:14px; margin-bottom:6px;">
+        <div class="stage-fill" style="width:${stagePct}%; height:14px; background:linear-gradient(90deg, ${stageColor}88 0%, ${stageColor} 100%)"></div>
+        <div class="stage-marker" style="left:${normalPct}%; height:20px; top:-3px; background:#7bb369;"></div>
+        <div class="stage-marker" style="left:${actionPct}%; height:20px; top:-3px; background:#d4a05c;"></div>
+        <div class="stage-marker" style="left:${minorPct}%;  height:20px; top:-3px; background:#e08a3c;"></div>
+        <div class="stage-marker" style="left:${modPct}%;    height:20px; top:-3px; background:#c85a5a;"></div>
+        <div class="stage-marker" style="left:${majorPct}%;  height:20px; top:-3px; background:#a04080;"></div>
       </div>
-      <div class="stage-legend">
-        <span style="color:#7bb369">NORMAL 100%</span>
-        <span style="color:#d4a05c">ELEVATED</span>
-        <span style="color:#c85a5a">FLOOD</span>
+
+      <div style="position:relative; height:48px; font-family:'IBM Plex Mono', monospace; font-size:8.5px; letter-spacing:0.05em; line-height:1.3; margin-top:10px;">
+        <div style="position:absolute; top:0; left:${normalPct}%; transform:translateX(-50%); color:#7bb369; text-align:center; white-space:nowrap;"><div>NORMAL</div><div>~${STAGE_NORMAL}'</div></div>
+        <div style="position:absolute; top:0; left:${actionPct}%; transform:translateX(-50%); color:#d4a05c; text-align:center; white-space:nowrap;"><div>ACTION</div><div>${STAGE_ACTION}'</div></div>
+        <div style="position:absolute; top:24px; left:${minorPct}%; transform:translateX(-50%); color:#e08a3c; text-align:center; white-space:nowrap;"><div>MINOR ${STAGE_MINOR}'</div></div>
+        <div style="position:absolute; top:0; left:${modPct}%; transform:translateX(-50%); color:#c85a5a; text-align:center; white-space:nowrap;"><div>MOD</div><div>${STAGE_MODERATE}'</div></div>
+        <div style="position:absolute; top:0; left:${majorPct}%; transform:translateX(-50%); color:#a04080; text-align:center; white-space:nowrap;"><div>MAJOR</div><div>${STAGE_MAJOR}'</div></div>
       </div>
+
+      <!-- FLOW GROUP -->
+      <div style="border-top:1px dashed rgba(244,237,228,0.08); padding-top:14px; margin-top:6px;">
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:9px; letter-spacing:0.18em; color:#6b8196; text-transform:uppercase; margin-bottom:8px;">Discharge</div>
+        <div style="display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;">
+          <div class="rval" style="font-size:30px;">${river.discharge_kcfs.toFixed(1)}<span class="runit">kcfs</span></div>
+          <div style="display:flex; align-items:baseline; gap:4px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8ba3b8;">
+            ${svg(riseIcon,12,'#8ba3b8')}<span>${riseDisplay} 24h</span>
+          </div>
+        </div>
+        ${river.seasonal_kcfs != null ? `
+        <div style="display:flex; justify-content:space-between; align-items:baseline; padding-top:8px; font-family:'IBM Plex Mono',monospace;">
+          <span style="font-size:10px; color:#6b8196; letter-spacing:0.18em;">VS SEASONAL NORMAL</span>
+          <span style="font-size:13px; color:${river.discharge_kcfs > river.seasonal_kcfs * 1.2 ? '#d4a05c' : river.discharge_kcfs < river.seasonal_kcfs * 0.8 ? '#6da3c8' : '#7bb369'};">
+            ${(river.discharge_kcfs > river.seasonal_kcfs ? '+' : '')}${(((river.discharge_kcfs / river.seasonal_kcfs) - 1) * 100).toFixed(0)}%
+            <span style="color:#6b8196; font-size:10px; margin-left:4px;">(norm ${river.seasonal_kcfs.toFixed(0)})</span>
+          </span>
+        </div>
+        ` : ''}
+      </div>
+
       ${renderRiverGraph(river.history)}
-      <div class="river-note">Modeled river flow vs the past 14-day average. Rising trends are the strongest signal for incoming debris (logs, brush, washed-out docks).</div>
+
+      <div class="river-note">
+        Stage estimated from modeled discharge. Flood thresholds match the NWS Bellevue gauge (BLVI4).
+        Rising trends indicate incoming debris (logs, brush, washed-out docks).
+      </div>
     </div>
   `;
 }
@@ -910,7 +1201,7 @@ function renderHourly(hourly) {
   `;
 }
 
-function renderDaily(daily, river) {
+function renderDaily(daily, river, hourly) {
   if (!daily) return '';
   const days = daily.time.slice(0, 7).map((d, i) => {
     const windMax = daily.wind_speed_10m_max[i];
@@ -919,7 +1210,7 @@ function renderDaily(daily, river) {
     const pop = daily.precipitation_probability_max[i];
     const windTone = windMax > 20 ? '#c85a5a' : windMax > 15 ? '#d4a05c' : '#d4c7b8';
     const uvColor = uvBand(uvMax)[1];
-    const score = calcDailyScore(daily, i, river);
+    const score = calcDailyScore(daily, i, river, hourly);
     const scoreColor = score >= 80 ? '#7bb369'
                      : score >= 60 ? '#d4a05c'
                      : score >= 40 ? '#e08a3c' : '#c85a5a';
@@ -994,10 +1285,10 @@ function render() {
       : renderSafety(safety)
     }
     ${renderSuggestedWindow(window_)}
-    ${state.weather ? renderCurrent(state.weather.current) : ''}
+    ${state.weather ? renderCurrent(state.weather.current, state.weather.daily) : ''}
     ${renderRiver(state.river)}
     ${state.weather ? renderHourly(state.weather.hourly) : ''}
-    ${state.weather ? renderDaily(state.weather.daily, state.river) : ''}
+    ${state.weather ? renderDaily(state.weather.daily, state.river, state.weather.hourly) : ''}
     ${renderFooter()}
   `;
   const btn = document.getElementById('refresh');
@@ -1022,14 +1313,17 @@ async function loadAll() {
 render();
 loadAll();
 
-// Refresh when app regains focus (e.g., switching back from another app)
-let lastRefresh = Date.now();
-document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && Date.now() - lastRefresh > 5 * 60 * 1000) {
-    lastRefresh = Date.now();
+// Schedule next refresh at the top of the next hour, then every hour after.
+// Manual refresh button still works for on-demand updates.
+function scheduleHourlyRefresh() {
+  const now = new Date();
+  const msUntilNextHour = (60 - now.getMinutes()) * 60 * 1000 - now.getSeconds() * 1000 - now.getMilliseconds();
+  setTimeout(() => {
     loadAll();
-  }
-});
+    setInterval(loadAll, 60 * 60 * 1000); // every hour after first top-of-hour
+  }, msUntilNextHour);
+}
+scheduleHourlyRefresh();
 </script>
 </body>
 </html>
