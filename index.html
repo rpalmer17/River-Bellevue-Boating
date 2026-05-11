@@ -306,11 +306,17 @@ function uvBand(uv) {
   return ['Extreme', '#a04080'];
 }
 
+function parseLocalDate(iso) {
+  // ISO date-only strings ("2026-04-28") parse as UTC in JS, which shifts
+  // them back a day in negative-UTC timezones. Force local interpretation.
+  if (typeof iso === 'string' && iso.length === 10) return new Date(iso + 'T12:00:00');
+  return new Date(iso);
+}
 function fmtTime(iso) {
   return new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', hour12: true }).replace(' ','');
 }
-function fmtDay(iso) { return new Date(iso).toLocaleDateString('en-US', { weekday: 'short' }); }
-function fmtDate(iso) { return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); }
+function fmtDay(iso) { return parseLocalDate(iso).toLocaleDateString('en-US', { weekday: 'short' }); }
+function fmtDate(iso) { return parseLocalDate(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); }
 
 // ============================================================================
 // FETCH
